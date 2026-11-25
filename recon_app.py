@@ -94,9 +94,10 @@ def prepare_t24(raw: bytes, name: str):
 MTN_COLUMNS = [
     "Id", "External id", "Date", "Status", "Type",
     "From", "From account", "From name", "From handler name",
-    "To", "To account", "To name", "To handler name", "To message",
+    "To", "Fee", "To account", "To name", "To handler name", "To message",
     "Initiated by", "Currency", "Amount", "Balance",
 ]
+MTN_OPTIONAL = {"Fee"}   # filled with 0 when a file has no Fee column
 
 
 def _read_mtn(raw: bytes, name: str):
@@ -115,9 +116,11 @@ def _read_mtn(raw: bytes, name: str):
 
 def prepare_mtn_file(raw: bytes, name: str):
     df = _read_mtn(raw, name)
-    missing = [c for c in MTN_COLUMNS if c not in df.columns]
+    missing = [c for c in MTN_COLUMNS if c not in df.columns and c not in MTN_OPTIONAL]
     if missing:
         raise ValueError(f"missing columns {missing}")
+    df = df.with_columns([pl.lit(None, pl.String).alias(c)
+                          for c in MTN_OPTIONAL if c not in df.columns])
 
     # Drop completely empty rows first, then clean
     df = df.select(MTN_COLUMNS).filter(
@@ -130,6 +133,8 @@ def prepare_mtn_file(raw: bytes, name: str):
                            .fill_null("") == "")
                    .then(pl.lit("GHS"))
                    .otherwise(pl.col("Currency").cast(pl.String).str.strip_chars()),
+        Fee=pl.col("Fee").cast(pl.String).str.replace_all(r"[,\s]", "")
+              .cast(pl.Float64, strict=False).fill_null(0.0),
         SOURCE_FILE=pl.lit(name),
     )
 
@@ -175,14 +180,18 @@ def _amount(col, ignore_sign):
     return a.abs() if ignore_sign else a
 
 
-def reconcile(t24_ova, mtn_ova, success_statuses, ignore_sign=True,
+def reconcile(t24_ova, mtn_ova, success_statuses, ignore_sign=True, include_fee=False,
               t24_key="TRANSACTION_REF", mtn_key="Id"):
     t24 = (t24_ova.rename({c: f"T24_{c}" for c in t24_ova.columns})
            .with_columns(REF=pl.col(f"T24_{t24_key}").cast(pl.Int64, strict=False),
                          T24_AMOUNT=_amount("T24_AMOUNT", ignore_sign), _IN_T24=pl.lit(True)))
     mtn = (mtn_ova.rename({c: f"MTN_{c}" for c in mtn_ova.columns})
            .with_columns(REF=pl.col(f"MTN_{mtn_key}").cast(pl.Int64, strict=False),
-                         MTN_Amount=_amount("MTN_Amount", ignore_sign), _IN_MTN=pl.lit(True)))
+                         MTN_Amount=_amount("MTN_Amount", ignore_sign),
+                         MTN_Fee=_amount("MTN_Fee", ignore_sign).fill_null(0.0),
+                         _IN_MTN=pl.lit(True))
+           .with_columns(MTN_COMPARE_AMOUNT=(pl.col("MTN_Amount") + pl.col("MTN_Fee"))
+                         if include_fee else pl.col("MTN_Amount")))
 
     occ = pl.int_range(pl.len()).over("REF").alias("_OCC")   # pair duplicates 1-to-1
     recon = (t24.filter(pl.col("REF").is_not_null()).with_columns(occ)
@@ -200,7 +209,7 @@ def reconcile(t24_ova, mtn_ova, success_statuses, ignore_sign=True,
             .when(pl.col("REF").is_null()).then(pl.lit("MTN_NO_ID"))
             .when(pl.col("_IN_MTN").is_null()).then(pl.lit("MISSING_IN_MTN"))
             .when(pl.col("_IN_T24").is_null()).then(pl.lit("MISSING_IN_T24"))
-            .when((pl.col("T24_AMOUNT") != pl.col("MTN_Amount")).fill_null(True))
+            .when((pl.col("T24_AMOUNT") != pl.col("MTN_COMPARE_AMOUNT")).fill_null(True))
                 .then(pl.lit("AMOUNT_MISMATCH"))
             .when((up("T24_CURRENCY") != up("MTN_Currency")).fill_null(True))
                 .then(pl.lit("CURRENCY_MISMATCH"))
@@ -208,11 +217,12 @@ def reconcile(t24_ova, mtn_ova, success_statuses, ignore_sign=True,
                 .then(pl.lit("MTN_NOT_SUCCESSFUL"))
             .otherwise(pl.lit("MATCHED"))
         ),
-        AMOUNT_DIFF=(pl.col("T24_AMOUNT") - pl.col("MTN_Amount")).round(2),
+        AMOUNT_DIFF=(pl.col("T24_AMOUNT") - pl.col("MTN_COMPARE_AMOUNT")).round(2),
         DUPLICATE_REF=pl.col("REF").is_not_null() & (pl.col("_OCC").max().over("REF") > 0),
     )
 
-    lead = ["RECON_STATUS", "REF", "T24_AMOUNT", "MTN_Amount", "AMOUNT_DIFF", "DUPLICATE_REF"]
+    lead = ["RECON_STATUS", "REF", "T24_AMOUNT", "MTN_Amount", "MTN_Fee",
+            "MTN_COMPARE_AMOUNT", "AMOUNT_DIFF", "DUPLICATE_REF"]
     order = {s: i for i, s in enumerate(STATUS_INFO)}
     return (recon
             .with_columns(_ORD=pl.col("RECON_STATUS").replace_strict(order))
@@ -227,12 +237,13 @@ def summarise(recon):
         ROWS=pl.len(),
         T24_AMOUNT=pl.col("T24_AMOUNT").sum().round(2),
         MTN_AMOUNT=pl.col("MTN_Amount").sum().round(2),
+        MTN_FEE=pl.col("MTN_Fee").sum().round(2),
     )
     return (pl.DataFrame({"RECON_STATUS": list(STATUS_INFO),
                           "DESCRIPTION": list(STATUS_INFO.values())})
             .join(counts, on="RECON_STATUS", how="left")
             .with_columns(pl.col("ROWS").fill_null(0),
-                          pl.col("T24_AMOUNT", "MTN_AMOUNT").fill_null(0.0)))
+                          pl.col("T24_AMOUNT", "MTN_AMOUNT", "MTN_FEE").fill_null(0.0)))
 
 
 # =====================================================================
@@ -260,12 +271,14 @@ def _t24_date(dt_col, pd_col):
     )
 
 
-def completeness(t24_ova, mtn_ova, ignore_sign=True):
+def completeness(t24_ova, mtn_ova, ignore_sign=True, include_fee=False):
     """Returns (coverage, daily, messages, (common_start, common_end))."""
     t24_dt = t24_ova.select(DT=_t24_date("DATE_AND_TIME", "PROCESS_DATE"),
                             AMT=_amount("AMOUNT", ignore_sign))
-    mtn_dt = mtn_ova.select(DT=_mtn_date(mtn_ova, "Date"),
-                            AMT=_amount("Amount", ignore_sign))
+    mtn_amt = _amount("Amount", ignore_sign)
+    if include_fee:
+        mtn_amt = mtn_amt + _amount("Fee", ignore_sign).fill_null(0.0)
+    mtn_dt = mtn_ova.select(DT=_mtn_date(mtn_ova, "Date"), AMT=mtn_amt)
 
     coverage = pl.concat([
         d.select(SOURCE=pl.lit(s), ROWS=pl.len(), NO_DATE=pl.col("DT").null_count(),
@@ -378,6 +391,8 @@ def main():
         statuses = st.text_input("MTN statuses that count as successful", "SUCCESSFUL",
                                  help="Comma-separated")
         ignore_sign = st.checkbox("Ignore amount sign (MTN debits are negative)", value=True)
+        include_fee = st.checkbox("Add MTN Fee to Amount before comparing", value=False,
+                                  help="Tick if T24 posts the amount including the MTN fee")
 
     if not t24_file or not mtn_files:
         st.info("Upload the T24 file and the MTN files in the sidebar to start.")
@@ -391,19 +406,20 @@ def main():
         return
 
     success = [s for s in statuses.split(",") if s.strip()]
-    recon = reconcile(t24_ova, mtn_ova, success, ignore_sign)
+    recon = reconcile(t24_ova, mtn_ova, success, ignore_sign, include_fee)
     summary = summarise(recon)
-    coverage, daily, cov_msgs, common = completeness(t24_ova, mtn_ova, ignore_sign)
+    coverage, daily, cov_msgs, common = completeness(t24_ova, mtn_ova, ignore_sign, include_fee)
     matched = recon.filter(pl.col("RECON_STATUS") == "MATCHED")
     unrec = flag_outside_period(recon.filter(pl.col("RECON_STATUS") != "MATCHED"), common)
 
     # ---- headline numbers
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("T24 rows", f"{t24_ova.height:,}")
     c2.metric("MTN rows", f"{mtn_ova.height:,}")
     c3.metric("Matched", f"{matched.height:,}")
     c4.metric("Unreconciled", f"{unrec.height:,}")
     c5.metric("Match rate", f"{matched.height / max(recon.height, 1):.1%}")
+    c6.metric("MTN fees", f"{mtn_ova['Fee'].abs().sum():,.2f}")
 
     with st.expander("Load log"):
         for m in t24_msgs + mtn_msgs:
