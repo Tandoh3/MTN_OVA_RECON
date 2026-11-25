@@ -173,16 +173,21 @@ def prepare_mtn(files):
 STATUS_INFO = {
     "MISSING_IN_MTN":     "In T24 but no MTN transaction with that Id",
     "MISSING_IN_T24":     "In MTN but not posted in T24",
-    "AMOUNT_MISMATCH":    "Same reference, amounts differ",
+    "AMOUNT_MISMATCH":    "Same reference, T24 equals neither MTN Amount nor Amount + Fee",
     "CURRENCY_MISMATCH":  "Same reference and amount, currencies differ",
     "MTN_NOT_SUCCESSFUL": "Posted in T24 but MTN status is not successful",
     "T24_NO_REFERENCE":   "T24 row with no number in TRANSACTION_REF",
     "MTN_NO_ID":          "MTN row with no usable Id",
-    "MATCHED":            "Reference, amount, currency and status all agree",
+    "MATCHED":            "Reference, amount (or amount + fee), currency and status all agree",
 }
 
 
-def _amount(col, ignore_sign):
+# Fixed recon rules (not user-editable)
+SUCCESS_STATUSES = ["SUCCESSFUL"]   # MTN statuses that count as completed
+IGNORE_SIGN = True                  # MTN debits come as negative amounts
+
+
+def _amount(col, ignore_sign=IGNORE_SIGN):
     a = (pl.col(col).cast(pl.String).str.replace_all(r"[,\s]", "")
          .cast(pl.Float64, strict=False))
     return a.abs() if ignore_sign else a
@@ -195,8 +200,11 @@ def _ensure_fee(mtn_ova):
     return mtn_ova
 
 
-def reconcile(t24_ova, mtn_ova, success_statuses, ignore_sign=True, include_fee=False,
+def reconcile(t24_ova, mtn_ova, success_statuses=SUCCESS_STATUSES, ignore_sign=IGNORE_SIGN,
               t24_key="TRANSACTION_REF", mtn_key="Id"):
+    """Amount check: T24 must equal MTN Amount exactly. If it doesn't, it may
+    equal MTN Amount + Fee exactly (fee not considered); that row still
+    matches and FEE_APPLIED is True."""
     mtn_ova = _ensure_fee(mtn_ova)
     t24 = (t24_ova.rename({c: f"T24_{c}" for c in t24_ova.columns})
            .with_columns(REF=pl.col(f"T24_{t24_key}").cast(pl.Int64, strict=False),
@@ -206,8 +214,7 @@ def reconcile(t24_ova, mtn_ova, success_statuses, ignore_sign=True, include_fee=
                          MTN_Amount=_amount("MTN_Amount", ignore_sign),
                          MTN_Fee=_amount("MTN_Fee", ignore_sign).fill_null(0.0),
                          _IN_MTN=pl.lit(True))
-           .with_columns(MTN_COMPARE_AMOUNT=(pl.col("MTN_Amount") + pl.col("MTN_Fee"))
-                         if include_fee else pl.col("MTN_Amount")))
+           .with_columns(MTN_AMOUNT_PLUS_FEE=(pl.col("MTN_Amount") + pl.col("MTN_Fee")).round(2)))
 
     occ = pl.int_range(pl.len()).over("REF").alias("_OCC")   # pair duplicates 1-to-1
     recon = (t24.filter(pl.col("REF").is_not_null()).with_columns(occ)
@@ -219,6 +226,15 @@ def reconcile(t24_ova, mtn_ova, success_statuses, ignore_sign=True, include_fee=
 
     up = lambda c: pl.col(c).cast(pl.String).str.strip_chars().str.to_uppercase()
     ok_status = [s.strip().upper() for s in success_statuses]
+    exact = (pl.col("T24_AMOUNT") == pl.col("MTN_Amount")).fill_null(False)
+    with_fee = ((pl.col("MTN_Fee") != 0)
+                & (pl.col("T24_AMOUNT").round(2) == pl.col("MTN_AMOUNT_PLUS_FEE"))).fill_null(False)
+    recon = recon.with_columns(FEE_APPLIED=~exact & with_fee)
+    recon = recon.with_columns(
+        MTN_COMPARE_AMOUNT=pl.when(pl.col("FEE_APPLIED"))
+                             .then(pl.col("MTN_AMOUNT_PLUS_FEE"))
+                             .otherwise(pl.col("MTN_Amount")),
+    )
     recon = recon.with_columns(
         RECON_STATUS=(
             pl.when(pl.col("REF").is_null() & pl.col("_IN_T24")).then(pl.lit("T24_NO_REFERENCE"))
@@ -238,7 +254,8 @@ def reconcile(t24_ova, mtn_ova, success_statuses, ignore_sign=True, include_fee=
     )
 
     lead = ["RECON_STATUS", "REF", "T24_AMOUNT", "MTN_Amount", "MTN_Fee",
-            "MTN_COMPARE_AMOUNT", "AMOUNT_DIFF", "DUPLICATE_REF"]
+            "MTN_AMOUNT_PLUS_FEE", "FEE_APPLIED", "MTN_COMPARE_AMOUNT",
+            "AMOUNT_DIFF", "DUPLICATE_REF"]
     order = {s: i for i, s in enumerate(STATUS_INFO)}
     return (recon
             .with_columns(_ORD=pl.col("RECON_STATUS").replace_strict(order))
@@ -254,11 +271,12 @@ def summarise(recon):
         T24_AMOUNT=pl.col("T24_AMOUNT").sum().round(2),
         MTN_AMOUNT=pl.col("MTN_Amount").sum().round(2),
         MTN_FEE=pl.col("MTN_Fee").sum().round(2),
+        MATCHED_VIA_FEE=pl.col("FEE_APPLIED").sum(),
     )
     return (pl.DataFrame({"RECON_STATUS": list(STATUS_INFO),
                           "DESCRIPTION": list(STATUS_INFO.values())})
             .join(counts, on="RECON_STATUS", how="left")
-            .with_columns(pl.col("ROWS").fill_null(0),
+            .with_columns(pl.col("ROWS", "MATCHED_VIA_FEE").fill_null(0),
                           pl.col("T24_AMOUNT", "MTN_AMOUNT", "MTN_FEE").fill_null(0.0)))
 
 
@@ -287,14 +305,15 @@ def _t24_date(dt_col, pd_col):
     )
 
 
-def completeness(t24_ova, mtn_ova, ignore_sign=True, include_fee=False):
+def completeness(t24_ova, mtn_ova, fee_ids=(), ignore_sign=IGNORE_SIGN):
     """Returns (coverage, daily, messages, (common_start, common_end))."""
     t24_dt = t24_ova.select(DT=_t24_date("DATE_AND_TIME", "PROCESS_DATE"),
                             AMT=_amount("AMOUNT", ignore_sign))
     mtn_ova = _ensure_fee(mtn_ova)
     mtn_amt = _amount("Amount", ignore_sign)
-    if include_fee:
-        mtn_amt = mtn_amt + _amount("Fee", ignore_sign).fill_null(0.0)
+    # add the fee for the transactions the recon matched via amount + fee
+    mtn_amt = mtn_amt + pl.when(pl.col("Id").is_in(list(fee_ids))).then(
+        _amount("Fee", ignore_sign).fill_null(0.0)).otherwise(0.0)
     mtn_dt = mtn_ova.select(DT=_mtn_date(mtn_ova, "Date"), AMT=mtn_amt)
 
     coverage = pl.concat([
@@ -400,16 +419,10 @@ def main():
     st.title("MTN OVA ↔ T24 OVA Reconciliation")
 
     with st.sidebar:
-        st.header("1. Upload data")
+        st.header("Upload data")
         t24_file = st.file_uploader("T24 OVA file", type=["csv", "txt"])
         mtn_files = st.file_uploader("MTN OVA files (select all)", type=["csv", "txt", "xlsx", "xls"],
                                      accept_multiple_files=True)
-        st.header("2. Settings")
-        statuses = st.text_input("MTN statuses that count as successful", "SUCCESSFUL",
-                                 help="Comma-separated")
-        ignore_sign = st.checkbox("Ignore amount sign (MTN debits are negative)", value=True)
-        include_fee = st.checkbox("Add MTN Fee to Amount before comparing", value=False,
-                                  help="Tick if T24 posts the amount including the MTN fee")
 
     if not t24_file or not mtn_files:
         st.info("Upload the T24 file and the MTN files in the sidebar to start.")
@@ -422,21 +435,22 @@ def main():
         st.error(f"Could not load the data: {e}")
         return
 
-    success = [s for s in statuses.split(",") if s.strip()]
-    recon = reconcile(t24_ova, mtn_ova, success, ignore_sign, include_fee)
+    recon = reconcile(t24_ova, mtn_ova)
+    fee_ids = recon.filter(pl.col("FEE_APPLIED"))["REF"].unique().to_list()
     summary = summarise(recon)
-    coverage, daily, cov_msgs, common = completeness(t24_ova, mtn_ova, ignore_sign, include_fee)
+    coverage, daily, cov_msgs, common = completeness(t24_ova, mtn_ova, fee_ids)
     matched = recon.filter(pl.col("RECON_STATUS") == "MATCHED")
     unrec = flag_outside_period(recon.filter(pl.col("RECON_STATUS") != "MATCHED"), common)
 
     # ---- headline numbers
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
     c1.metric("T24 rows", f"{t24_ova.height:,}")
     c2.metric("MTN rows", f"{mtn_ova.height:,}")
     c3.metric("Matched", f"{matched.height:,}")
     c4.metric("Unreconciled", f"{unrec.height:,}")
     c5.metric("Match rate", f"{matched.height / max(recon.height, 1):.1%}")
-    c6.metric("MTN fees", f"{_ensure_fee(mtn_ova)['Fee'].cast(pl.Float64, strict=False).abs().sum():,.2f}")
+    c6.metric("Matched via fee", f"{int(recon['FEE_APPLIED'].sum()):,}")
+    c7.metric("MTN fees", f"{_ensure_fee(mtn_ova)['Fee'].cast(pl.Float64, strict=False).abs().sum():,.2f}")
 
     with st.expander("Load log"):
         for m in t24_msgs + mtn_msgs:
