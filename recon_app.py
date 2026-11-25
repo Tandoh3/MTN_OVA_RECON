@@ -97,7 +97,8 @@ MTN_COLUMNS = [
     "To", "Fee", "To account", "To name", "To handler name", "To message",
     "Initiated by", "Currency", "Amount", "Balance",
 ]
-MTN_OPTIONAL = {"Fee"}   # filled with 0 when a file has no Fee column
+MTN_OPTIONAL = {"Fee"}
+FEE_ALIASES = {"fee", "fromfee"}   # "Fee", "From / Fee", "From fee", "From/Fee"   # filled with 0 when a file has no Fee column
 
 
 def _read_mtn(raw: bytes, name: str):
@@ -111,7 +112,14 @@ def _read_mtn(raw: bytes, name: str):
         header = text.split("\n", 1)[0]
         sep = max([",", "|", ";", "\t"], key=header.count)
         df = pl.read_csv(io.StringIO(text), separator=sep, infer_schema=False)
-    return df.rename({c: c.strip().strip('"').strip() for c in df.columns})
+    df = df.rename({c: c.strip().strip('"').strip() for c in df.columns})
+
+    # The fee column comes as "From / Fee" (or "From fee", "Fee"): call it Fee
+    fee_cols = [c for c in df.columns
+                if re.sub(r"[^a-z]", "", c.lower()) in FEE_ALIASES]
+    if fee_cols and "Fee" not in df.columns:
+        df = df.rename({fee_cols[0]: "Fee"})
+    return df
 
 
 def prepare_mtn_file(raw: bytes, name: str):
@@ -180,8 +188,16 @@ def _amount(col, ignore_sign):
     return a.abs() if ignore_sign else a
 
 
+def _ensure_fee(mtn_ova):
+    """Add a zero Fee column if the MTN data has none (e.g. older cached data)."""
+    if "Fee" not in mtn_ova.columns:
+        return mtn_ova.with_columns(Fee=pl.lit(0.0))
+    return mtn_ova
+
+
 def reconcile(t24_ova, mtn_ova, success_statuses, ignore_sign=True, include_fee=False,
               t24_key="TRANSACTION_REF", mtn_key="Id"):
+    mtn_ova = _ensure_fee(mtn_ova)
     t24 = (t24_ova.rename({c: f"T24_{c}" for c in t24_ova.columns})
            .with_columns(REF=pl.col(f"T24_{t24_key}").cast(pl.Int64, strict=False),
                          T24_AMOUNT=_amount("T24_AMOUNT", ignore_sign), _IN_T24=pl.lit(True)))
@@ -275,6 +291,7 @@ def completeness(t24_ova, mtn_ova, ignore_sign=True, include_fee=False):
     """Returns (coverage, daily, messages, (common_start, common_end))."""
     t24_dt = t24_ova.select(DT=_t24_date("DATE_AND_TIME", "PROCESS_DATE"),
                             AMT=_amount("AMOUNT", ignore_sign))
+    mtn_ova = _ensure_fee(mtn_ova)
     mtn_amt = _amount("Amount", ignore_sign)
     if include_fee:
         mtn_amt = mtn_amt + _amount("Fee", ignore_sign).fill_null(0.0)
@@ -374,7 +391,7 @@ def load_t24(raw, name):
 
 
 @st.cache_data(show_spinner="Reading MTN files...")
-def load_mtn(files):
+def load_mtn(files, _version=3):   # bump _version when the MTN cleaning changes
     return prepare_mtn(list(files))
 
 
@@ -419,7 +436,7 @@ def main():
     c3.metric("Matched", f"{matched.height:,}")
     c4.metric("Unreconciled", f"{unrec.height:,}")
     c5.metric("Match rate", f"{matched.height / max(recon.height, 1):.1%}")
-    c6.metric("MTN fees", f"{mtn_ova['Fee'].abs().sum():,.2f}")
+    c6.metric("MTN fees", f"{_ensure_fee(mtn_ova)['Fee'].cast(pl.Float64, strict=False).abs().sum():,.2f}")
 
     with st.expander("Load log"):
         for m in t24_msgs + mtn_msgs:
